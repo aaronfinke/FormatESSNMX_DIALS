@@ -4,6 +4,7 @@ import logging
 
 import h5py
 import numpy as np
+import re
 
 import cctbx.array_family.flex as flex
 
@@ -17,6 +18,116 @@ from dxtbx.model.scan import Scan, ScanFactory
 from dxtbx.model.tof_helpers import wavelength_from_tof
 
 logger = logging.getLogger(__name__)
+
+# Factor that converts a value expressed in <key> into microseconds.
+_TO_US = {
+    "s": 1e6, "sec": 1e6, "secs": 1e6, "second": 1e6, "seconds": 1e6,
+    "ms": 1e3, "msec": 1e3, "millisecond": 1e3, "milliseconds": 1e3,
+    "us": 1.0, "usec": 1.0, "microsecond": 1.0, "microseconds": 1.0,
+    "µs": 1.0,   # U+00B5 MICRO SIGN
+    "μs": 1.0,   # U+03BC GREEK SMALL LETTER MU
+    "ns": 1e-3, "nsec": 1e-3, "nanosecond": 1e-3, "nanoseconds": 1e-3,
+    "ps": 1e-6, "picosecond": 1e-6, "picoseconds": 1e-6,
+}
+
+# NeXus says "units"; real files in the wild also use these.
+_UNIT_ATTRS = ("units", "unit", "Units", "Unit", "UNITS")
+
+# Neutron TOF: t[us] = 252.7784 * lambda[A] * L[m]
+TOF_CONSTANT = 252.7784
+
+
+def _as_text(value) -> str:
+    """HDF5 string attributes come back as bytes, str, or 0-d arrays of either."""
+    if isinstance(value, np.ndarray):
+        value = value.flat[0] if value.size else b""
+    if isinstance(value, (bytes, np.bytes_)):
+        value = value.decode("utf-8", "replace")
+    return str(value).strip()
+
+
+def units_of(dataset, search_parent: bool = True) -> str | None:
+    """Return the unit string attached to ``dataset``, or None if absent.
+
+    Falls back to the containing group, since some writers put ``units`` on the
+    NXdata/NXdetector group rather than on the field.
+    """
+    for attrs in ([dataset.attrs] + ([dataset.parent.attrs] if search_parent else [])):
+        for key in _UNIT_ATTRS:
+            if key in attrs:
+                text = _as_text(attrs[key])
+                if text:
+                    return text
+    return None
+
+
+def time_factor_to_us(units: str) -> float:
+    """Multiplicative factor taking a value in ``units`` to microseconds.
+
+    Handles the Mantid/ISIS style scaled units too, e.g. ``100*ns``.
+    """
+    text = _as_text(units).replace(" ", "")
+    scale = 1.0
+    match = re.match(r"^([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\*?(.+)$", text)
+    if match:
+        scale, text = float(match.group(1)), match.group(2)
+    key = text.lower().rstrip(".")
+    try:
+        return scale * _TO_US[key]
+    except KeyError:
+        raise ValueError(f"unrecognised time unit {units!r}") from None
+
+
+def read_time_us(dataset, default_units: str | None = None) -> np.ndarray:
+    """Read an HDF5 time dataset and return it in microseconds.
+
+    ``default_units`` is used only when the file carries no units attribute at
+    all; it is logged loudly, because a silent guess is exactly the failure mode
+    this module exists to prevent.
+    """
+    values = np.asarray(dataset[()], dtype=float).ravel()
+    units = units_of(dataset)
+    if units is None:
+        if default_units is None:
+            raise ValueError(
+                f"{dataset.name} has no units attribute and no default was given; "
+                "refusing to guess the TOF scale"
+            )
+        units = default_units
+        logger.warning(
+            "%s has no units attribute; assuming %r. Fix the writer, or pass "
+            "default_units explicitly.", dataset.name, units
+        )
+    return values * time_factor_to_us(units)
+
+
+def expected_tof_range_us(distance_m: float, wavelength_range_a: tuple[float, float]):
+    """Physically plausible TOF window for a given flight path and bandwidth."""
+    lo, hi = sorted(wavelength_range_a)
+    return (TOF_CONSTANT * lo * distance_m, TOF_CONSTANT * hi * distance_m)
+
+
+def check_tof_plausible(tof_us, distance_m: float, wavelength_range_a, tol: float = 5.0):
+    """Warn if the TOF array is off by a suspicious factor (usually 1000x).
+
+    Returns the ratio of observed to expected magnitude; ~1 is healthy.
+    """
+    tof_us = np.asarray(tof_us, dtype=float)
+    if tof_us.size == 0:
+        return float("nan")
+    lo, hi = expected_tof_range_us(distance_m, wavelength_range_a)
+    observed = float(np.median(tof_us))
+    ratio = observed / (0.5 * (lo + hi))
+    if not (1.0 / tol) < ratio < tol:
+        logger.warning(
+            "TOF values look wrong by a factor of ~%.3g: median %.4g us, but a "
+            "%.1f m flight path over %.2f-%.2f A implies %.4g-%.4g us. Check the "
+            "units attribute on the TOF dataset.",
+            ratio, observed, distance_m, wavelength_range_a[0],
+            wavelength_range_a[1], lo, hi,
+        )
+    return ratio
+
 
 
 class FormatESSNMX(FormatHDF5):
